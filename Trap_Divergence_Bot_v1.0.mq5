@@ -1,19 +1,15 @@
 //+------------------------------------------------------------------+
 //|                                      Trap_Divergence_Bot_v1.0.mq5 |
-//|                                  Trap Divergence Bot — v1.0       |
+//|                         Trap Divergence Bot v1.2_DEBUG            |
 //+------------------------------------------------------------------+
-#property copyright "Trap Divergence Bot v1.0"
+#property copyright "Trap Divergence Bot v1.2_DEBUG"
 #property link      ""
-#property version   "1.01"
-#property description "Trap Divergence Bot — BB/Keltner squeeze + RSI hook/divergence trap"
+#property version   "1.20"
+#property description "Trap Divergence Bot v1.2_DEBUG — BB/Keltner squeeze + RSI trap (session filter UTC)"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\SymbolInfo.mqh>
-
-//+------------------------------------------------------------------+
-//| Manual news filter: full auto needs calendar/WebRequest.          |
-//+------------------------------------------------------------------+
 
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
@@ -67,6 +63,7 @@ input int               InpPeak2Window       = 10;
 input int               InpTimeExitBars      = 12;
 input double            InpSlExtraPips       = 2.0;
 input double            InpTp1VolumePct      = 50.0;
+input double            InpMinSLPips         = 8.0;      // Minimum SL distance in pips. Skip trade if smaller (safety filter)
 
 input group "=== Dashboard ==="
 input bool              InpShowDashboard     = false;
@@ -77,6 +74,11 @@ input color             InpColorGood         = clrLime;
 input color             InpColorWait         = clrTomato;
 input color             InpColorProgress     = clrGold;
 input color             InpColorTitle        = clrWhite;
+
+input group "=== Trading session (UTC via TimeGMT) ==="
+input bool              InpUseSessionFilter  = true;
+input int               InpSessionStartHour  = 7;
+input int               InpSessionEndHour    = 22;
 
 //+------------------------------------------------------------------+
 enum ENUM_TRAP_STATE
@@ -126,20 +128,38 @@ bool     g_tp1_done = false;
 string   g_last_trade_line = "Last trade: —";
 
 //+------------------------------------------------------------------+
+//| Session: UTC hours [start, end) using TimeGMT(). Overnight if      |
+//| startHour > endHour (e.g. 22 -> 7).                              |
+//+------------------------------------------------------------------+
+bool SessionAllowsNewEntries()
+  {
+   if(!InpUseSessionFilter) return true;
+   MqlDateTime g;
+   TimeToStruct(TimeGMT(), g);
+   int h = g.hour;
+   int s = InpSessionStartHour;
+   int e = InpSessionEndHour;
+   if(s == e) return true;
+   if(s < e)
+      return (h >= s && h < e);
+   return (h >= s || h < e);
+  }
+
+//+------------------------------------------------------------------+
 string BearStateStr()
   {
-   if(g_bear_st == TRAP_NEED_PEAK1) return "Hunt Peak1";
-   if(g_bear_st == TRAP_PEAK1_OK)   return "Peak2 window";
-   if(g_bear_st == TRAP_WAIT_TRIGGER) return "Wait trigger (close < UpperBB)";
+   if(g_bear_st == TRAP_NEED_PEAK1) return "NEED_PEAK1";
+   if(g_bear_st == TRAP_PEAK1_OK)   return "PEAK1_OK (Peak2 window)";
+   if(g_bear_st == TRAP_WAIT_TRIGGER) return "WAIT_TRIGGER";
    return "?";
   }
 
 //+------------------------------------------------------------------+
 string BullStateStr()
   {
-   if(g_bull_st == TRAP_NEED_PEAK1) return "Hunt Peak1";
-   if(g_bull_st == TRAP_PEAK1_OK)   return "Peak2 window";
-   if(g_bull_st == TRAP_WAIT_TRIGGER) return "Wait trigger (close > LowerBB)";
+   if(g_bull_st == TRAP_NEED_PEAK1) return "NEED_PEAK1";
+   if(g_bull_st == TRAP_PEAK1_OK)   return "PEAK1_OK (Peak2 window)";
+   if(g_bull_st == TRAP_WAIT_TRIGGER) return "WAIT_TRIGGER";
    return "?";
   }
 
@@ -156,35 +176,58 @@ bool BullTriggerBar(const int sh, const double lower_bb)
   }
 
 //+------------------------------------------------------------------+
-void DebugPrintNewBar(const int sh, const bool spread_ok,
-                      const double bu, const double bl, const double bbw,
-                      const double ku, const double kl, const double kcw,
-                      const bool sq, const double rsi1, const double H, const double L, const double C)
+void DebugJournalHeader(const datetime tbar, const double bbw, const double kcw, const bool sq,
+                        const double H, const double L, const double bu, const double bl, const double rsi1)
+  {
+   if(!InpDebugLog) return;
+   Print("=== NEW BAR [", TimeToString(tbar, TIME_DATE|TIME_MINUTES), "] ===");
+   Print("Squeeze = ", (sq ? "YES" : "NO"),
+         " | BB width = ", DoubleToString(bbw, 5),
+         " | Keltner width = ", DoubleToString(kcw, 5));
+   Print("H=", DoubleToString(H, g_digits), " L=", DoubleToString(L, g_digits),
+         " | UpperBB=", DoubleToString(bu, g_digits), " LowerBB=", DoubleToString(bl, g_digits),
+         " | RSI=", DoubleToString(rsi1, 2));
+   Print("Session (UTC) ", (InpUseSessionFilter ? "ON" : "OFF"),
+         " | allow entries = ", (SessionAllowsNewEntries() ? "YES" : "NO"),
+         " | [", IntegerToString(InpSessionStartHour), ":00 - ", IntegerToString(InpSessionEndHour), ":00)");
+   Print("Spread OK = ", (SpreadOK() ? "YES" : "NO"), " | SpreadPts=", DoubleToString((double)g_sym.Spread(), 1),
+         " | Max=", IntegerToString(InpMaxSpreadPoints));
+  }
+
+//+------------------------------------------------------------------+
+void DebugJournalBearBullSummary(const int sh, const double bu, const double bl)
   {
    if(!InpDebugLog) return;
 
-   datetime tbar = iTime(g_sym_name, g_tf, sh);
-   Print("=== NEW BAR [", TimeToString(tbar, TIME_DATE|TIME_MINUTES), "] ===");
-   Print("  Spread OK: ", (spread_ok ? "YES" : "NO"), " | SpreadPts=", (double)g_sym.Spread(),
-         " | Max=", (double)InpMaxSpreadPoints);
-   Print("  Squeeze (last ", IntegerToString(InpSqueezeLookback), " bars): ", (sq ? "YES" : "NO"),
-         " | BB_width=", DoubleToString(bbw, (g_digits+2)),
-         " | KC_width=", DoubleToString(kcw, (g_digits+2)),
-         " | BB<=KC: ", (bbw <= kcw ? "YES" : "NO"), " [bar1]");
-   Print("  H=", DoubleToString(H, g_digits), " L=", DoubleToString(L, g_digits),
-         " C=", DoubleToString(C, g_digits),
-         " | UpperBB=", DoubleToString(bu, g_digits), " LowerBB=", DoubleToString(bl, g_digits),
-         " | RSI=", DoubleToString(rsi1, 2));
-   Print("  BEAR trap: state=", BearStateStr(),
-         " | Peak1High=", DoubleToString(g_bear_p1_ext, g_digits),
-         " | Peak2High=", DoubleToString(g_bear_p2_high, g_digits),
-         " | P2 age ", IntegerToString(g_bear_p2_age), "/", IntegerToString(InpPeak2Window),
-         " | Trigger line: close<UpperBB? ", (BearTriggerBar(sh, bu) ? "YES" : "NO"));
-   Print("  BULL trap: state=", BullStateStr(),
-         " | Peak1Low=", DoubleToString(g_bull_p1_ext, g_digits),
-         " | Peak2Low=", DoubleToString(g_bull_p2_low, g_digits),
-         " | P2 age ", IntegerToString(g_bull_p2_age), "/", IntegerToString(InpPeak2Window),
-         " | Trigger line: close>LowerBB? ", (BullTriggerBar(sh, bl) ? "YES" : "NO"));
+   string bear_line = "BEAR trap | state=" + BearStateStr();
+   if(g_bear_st >= TRAP_PEAK1_OK && g_bear_p1_time > 0)
+      bear_line += " | Peak1 HIT at price " + DoubleToString(g_bear_p1_ext, g_digits);
+   else
+      bear_line += " | Peak1 not set";
+
+   if(g_bear_st == TRAP_PEAK1_OK)
+      bear_line += " | BEAR Peak2 progress: " + IntegerToString(g_bear_p2_age) + "/" + IntegerToString(InpPeak2Window);
+   else if(g_bear_st == TRAP_WAIT_TRIGGER)
+      bear_line += " | Divergence OK (Peak2 stored) | trigger need close < UpperBB";
+
+   bear_line += " | close<Upper? ";
+   bear_line += (BearTriggerBar(sh, bu) ? "YES" : "NO");
+   Print(bear_line);
+
+   string bull_line = "BULL trap | state=" + BullStateStr();
+   if(g_bull_st >= TRAP_PEAK1_OK && g_bull_p1_time > 0)
+      bull_line += " | Peak1 HIT at price " + DoubleToString(g_bull_p1_ext, g_digits);
+   else
+      bull_line += " | Peak1 not set";
+
+   if(g_bull_st == TRAP_PEAK1_OK)
+      bull_line += " | BULL Peak2 progress: " + IntegerToString(g_bull_p2_age) + "/" + IntegerToString(InpPeak2Window);
+   else if(g_bull_st == TRAP_WAIT_TRIGGER)
+      bull_line += " | Divergence OK (Peak2 stored) | trigger need close > LowerBB";
+
+   bull_line += " | close>Lower? ";
+   bull_line += (BullTriggerBar(sh, bl) ? "YES" : "NO");
+   Print(bull_line);
   }
 
 //+------------------------------------------------------------------+
@@ -441,7 +484,7 @@ void FireBearPending(const double bu_line)
    g_bear_st = TRAP_NEED_PEAK1;
    g_bear_p2_age = 0;
    if(InpDebugLog)
-      Print(">>> BEAR TRIGGER FIRED | close=", DoubleToString(Cl(1), g_digits),
+      Print(">>> BEAR TRIGGER FIRED - SELL pending | close=", DoubleToString(Cl(1), g_digits),
             " < UpperBB=", DoubleToString(bu_line, g_digits),
             " | SL ref HighPrice2=", DoubleToString(g_bear_p2_high, g_digits));
    if(g_bull_st == TRAP_WAIT_TRIGGER)
@@ -456,7 +499,7 @@ void FireBullPending(const double bl_line)
    g_bull_st = TRAP_NEED_PEAK1;
    g_bull_p2_age = 0;
    if(InpDebugLog)
-      Print(">>> BULL TRIGGER FIRED | close=", DoubleToString(Cl(1), g_digits),
+      Print(">>> BULL TRIGGER FIRED - BUY pending | close=", DoubleToString(Cl(1), g_digits),
             " > LowerBB=", DoubleToString(bl_line, g_digits),
             " | SL ref LowPrice2=", DoubleToString(g_bull_p2_low, g_digits));
    if(g_bear_st == TRAP_WAIT_TRIGGER)
@@ -468,36 +511,44 @@ void OnBarEvent()
   {
    const int sh = 1;
 
+   int bars_total = Bars(g_sym_name, g_tf);
+   if(bars_total < InpBBPeriod + InpKeltnerAtrPeriod + 5)
+      return;
+
    double bu, bm, bl;
    double ku, kl, kcw;
    double rsi1;
    if(!BB(sh, bu, bm, bl) || !KeltnerWidth(sh, ku, kl, kcw) || !Rsi(sh, rsi1))
+     {
+      if(InpDebugLog)
+         Print("=== NEW BAR: indicator buffer not ready, skip ===");
       return;
+     }
 
    double bbw = bu - bl;
    double H = Hi(sh);
    double L = Lo(sh);
-   double C = Cl(sh);
    bool sq = SqueezeRecent();
    g_bear_sq = sq;
    g_bull_sq = sq;
 
-   bool sp_ok = SpreadOK();
-   DebugPrintNewBar(sh, sp_ok, bu, bl, bbw, ku, kl, kcw, sq, rsi1, H, L, C);
+   datetime tbar = iTime(g_sym_name, g_tf, sh);
+   DebugJournalHeader(tbar, bbw, kcw, sq, H, L, bu, bl, rsi1);
 
-   if(!sp_ok)
+   //--- State machine (spread / pending gates)
+   if(!SpreadOK())
      {
-      if(InpDebugLog) Print("  OnBarEvent: SKIP (spread filter)");
+      if(InpDebugLog) Print("OnBarEvent: SKIP — spread filter");
+      DebugJournalBearBullSummary(sh, bu, bl);
       return;
      }
 
    if(g_pend_dir != 0)
      {
-      if(InpDebugLog) Print("  OnBarEvent: SKIP (pending entry in flight)");
+      if(InpDebugLog) Print("OnBarEvent: SKIP — pending entry in flight");
+      DebugJournalBearBullSummary(sh, bu, bl);
       return;
      }
-
-   datetime tbar = iTime(g_sym_name, g_tf, sh);
 
    //--- Bearish: Peak1
    if(g_bear_st == TRAP_NEED_PEAK1)
@@ -510,7 +561,7 @@ void OnBarEvent()
          g_bear_p2_age = 0;
          g_bear_p2_high = 0.0;
          if(InpDebugLog)
-            Print(">>> BEAR PEAK 1 HIT at HighPrice1=", DoubleToString(g_bear_p1_ext, g_digits),
+            Print(">>> BEAR PEAK 1 HIT at price ", DoubleToString(g_bear_p1_ext, g_digits),
                   " | UpperBB=", DoubleToString(bu, g_digits), " RSI=", DoubleToString(rsi1, 2));
         }
      }
@@ -531,22 +582,43 @@ void OnBarEvent()
             g_bear_p2_high = H;
             g_bear_st = TRAP_WAIT_TRIGGER;
             if(InpDebugLog)
-               Print(">>> BEAR DIVERGENCE (Peak2) HIT | HighPrice2=", DoubleToString(g_bear_p2_high, g_digits),
+               Print(">>> BEAR DIVERGENCE HIT | HighPrice2=", DoubleToString(g_bear_p2_high, g_digits),
                      " > HighPrice1=", DoubleToString(g_bear_p1_ext, g_digits),
-                     " RSI=", DoubleToString(r2, 2), " (", IntegerToString(InpRsiBearPeak2Lo), "-", IntegerToString(InpRsiBearPeak2Hi), ")");
+                     " RSI=", DoubleToString(r2, 2));
            }
          else if(InpDebugLog)
-            Print("  BEAR Peak2 progress ", IntegerToString(g_bear_p2_age), "/", IntegerToString(InpPeak2Window),
-                  " | need new high + RSI band — H=", DoubleToString(H, g_digits),
-                  " RSI=", DoubleToString(rsi1, 2));
+            Print("BEAR Peak2 progress: ", IntegerToString(g_bear_p2_age), "/", IntegerToString(InpPeak2Window),
+                  " | need H>", DoubleToString(g_bear_p1_ext, g_digits), " & RSI in [",
+                  IntegerToString(InpRsiBearPeak2Lo), ",", IntegerToString(InpRsiBearPeak2Hi), "] | H=",
+                  DoubleToString(H, g_digits), " RSI=", DoubleToString(rsi1, 2));
         }
      }
 
-   // Bearish: trigger (PDF: close below Upper BB) — may fire same bar as Peak2
+   // Bearish trigger: close < Upper BB (PDF)
    if(g_bear_st == TRAP_WAIT_TRIGGER && g_pend_dir == 0)
      {
       if(BearTriggerBar(sh, bu))
-         FireBearPending(bu);
+        {
+         if(!SessionAllowsNewEntries())
+           {
+            if(InpDebugLog)
+               Print(">>> BEAR TRIGGER blocked — outside session (UTC)");
+           }
+         else
+           {
+            double sl_price = g_bear_p2_high + InpSlExtraPips * PipUnit();
+            double entry = g_sym.Bid();
+            if(sl_price <= entry) sl_price = entry + 10.0 * g_point;
+            double dist_pips = (sl_price - entry) / PipUnit();
+            if(dist_pips < InpMinSLPips)
+              {
+               if(InpDebugLog)
+                  Print("SKIP BEAR — SL too small (", DoubleToString(dist_pips, 1), " pips < ", DoubleToString(InpMinSLPips, 1), ")");
+              }
+            else
+               FireBearPending(bu);
+           }
+        }
      }
 
    //--- Bullish: Peak1
@@ -560,7 +632,7 @@ void OnBarEvent()
          g_bull_p2_age = 0;
          g_bull_p2_low = 0.0;
          if(InpDebugLog)
-            Print(">>> BULL PEAK 1 HIT at LowPrice1=", DoubleToString(g_bull_p1_ext, g_digits),
+            Print(">>> BULL PEAK 1 HIT at price ", DoubleToString(g_bull_p1_ext, g_digits),
                   " | LowerBB=", DoubleToString(bl, g_digits), " RSI=", DoubleToString(rsi1, 2));
         }
      }
@@ -581,23 +653,45 @@ void OnBarEvent()
             g_bull_p2_low = L;
             g_bull_st = TRAP_WAIT_TRIGGER;
             if(InpDebugLog)
-               Print(">>> BULL DIVERGENCE (Peak2) HIT | LowPrice2=", DoubleToString(g_bull_p2_low, g_digits),
+               Print(">>> BULL DIVERGENCE HIT | LowPrice2=", DoubleToString(g_bull_p2_low, g_digits),
                      " < LowPrice1=", DoubleToString(g_bull_p1_ext, g_digits),
-                     " RSI=", DoubleToString(r2b, 2), " (", IntegerToString(InpRsiBullPeak2Lo), "-", IntegerToString(InpRsiBullPeak2Hi), ")");
+                     " RSI=", DoubleToString(r2b, 2));
            }
          else if(InpDebugLog)
-            Print("  BULL Peak2 progress ", IntegerToString(g_bull_p2_age), "/", IntegerToString(InpPeak2Window),
-                  " | need new low + RSI band — L=", DoubleToString(L, g_digits),
-                  " RSI=", DoubleToString(rsi1, 2));
+            Print("BULL Peak2 progress: ", IntegerToString(g_bull_p2_age), "/", IntegerToString(InpPeak2Window),
+                  " | need L<", DoubleToString(g_bull_p1_ext, g_digits), " & RSI in [",
+                  IntegerToString(InpRsiBullPeak2Lo), ",", IntegerToString(InpRsiBullPeak2Hi), "] | L=",
+                  DoubleToString(L, g_digits), " RSI=", DoubleToString(rsi1, 2));
         }
      }
 
-   // Bullish: trigger (PDF: close above Lower BB)
    if(g_bull_st == TRAP_WAIT_TRIGGER && g_pend_dir == 0)
      {
       if(BullTriggerBar(sh, bl))
-         FireBullPending(bl);
+        {
+         if(!SessionAllowsNewEntries())
+           {
+            if(InpDebugLog)
+               Print(">>> BULL TRIGGER blocked — outside session (UTC)");
+           }
+         else
+           {
+            double sl_price = g_bull_p2_low - InpSlExtraPips * PipUnit();
+            double entry = g_sym.Ask();
+            if(sl_price >= entry) sl_price = entry - 10.0 * g_point;
+            double dist_pips = (entry - sl_price) / PipUnit();
+            if(dist_pips < InpMinSLPips)
+              {
+               if(InpDebugLog)
+                  Print("SKIP BULL — SL too small (", DoubleToString(dist_pips, 1), " pips < ", DoubleToString(InpMinSLPips, 1), ")");
+              }
+            else
+               FireBullPending(bl);
+           }
+        }
      }
+
+   DebugJournalBearBullSummary(sh, bu, bl);
   }
 
 //+------------------------------------------------------------------+
@@ -642,6 +736,12 @@ void ExecutePendingEntry()
   {
    if(g_pend_dir == 0) return;
    if(!SpreadOK()) return;
+   if(!SessionAllowsNewEntries())
+     {
+      if(InpDebugLog)
+         Print("ExecutePendingEntry: WAIT — session closed (UTC)");
+      return;
+     }
 
    int dir = g_pend_dir;
    double sl_price = g_pend_sl_extreme;
@@ -651,7 +751,11 @@ void ExecutePendingEntry()
       double price = g_sym.Bid();
       if(sl_price <= price) sl_price = price + 10.0 * g_point;
       double lots;
-      if(!LotsForRisk(false, price, sl_price, lots)) return;
+      if(!LotsForRisk(false, price, sl_price, lots))
+        {
+         if(InpDebugLog) Print("ExecutePendingEntry: SELL lots=0 or risk calc failed");
+         return;
+        }
       if(!g_trade.Sell(lots, g_sym_name, price, sl_price, 0.0, InpTradeComment))
         {
          Print("Sell error ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
@@ -660,14 +764,18 @@ void ExecutePendingEntry()
       g_pend_dir = 0;
       g_tp1_done = false;
       g_last_trade_line = StringFormat("Last trade: SELL %.2f lots @ %s", lots, DoubleToString(price, g_digits));
-      if(InpDebugLog) Print(">>> ORDER: SELL opened lots=", DoubleToString(lots, 2), " SL=", DoubleToString(sl_price, g_digits));
+      if(InpDebugLog) Print(">>> ORDER FILLED: SELL lots=", DoubleToString(lots, 2), " SL=", DoubleToString(sl_price, g_digits));
      }
    else if(dir > 0)
      {
       double price = g_sym.Ask();
       if(sl_price >= price) sl_price = price - 10.0 * g_point;
       double lots;
-      if(!LotsForRisk(true, price, sl_price, lots)) return;
+      if(!LotsForRisk(true, price, sl_price, lots))
+        {
+         if(InpDebugLog) Print("ExecutePendingEntry: BUY lots=0 or risk calc failed");
+         return;
+        }
       if(!g_trade.Buy(lots, g_sym_name, price, sl_price, 0.0, InpTradeComment))
         {
          Print("Buy error ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
@@ -676,7 +784,7 @@ void ExecutePendingEntry()
       g_pend_dir = 0;
       g_tp1_done = false;
       g_last_trade_line = StringFormat("Last trade: BUY %.2f lots @ %s", lots, DoubleToString(price, g_digits));
-      if(InpDebugLog) Print(">>> ORDER: BUY opened lots=", DoubleToString(lots, 2), " SL=", DoubleToString(sl_price, g_digits));
+      if(InpDebugLog) Print(">>> ORDER FILLED: BUY lots=", DoubleToString(lots, 2), " SL=", DoubleToString(sl_price, g_digits));
      }
   }
 
@@ -814,7 +922,8 @@ void UpdateDashboard()
 
    color ok = InpColorGood, wt = InpColorWait, pr = InpColorProgress, wt2 = InpColorTitle;
 
-   string nf = InpUseNewsFilter ? "NEWS FILTER: PAUSED (manual mode)" : "News filter: OFF";
+   string nf = InpUseNewsFilter ? "NEWS FILTER: PAUSED" : "News filter: OFF";
+   string sess = (InpUseSessionFilter ? (" | Sess UTC " + IntegerToString(InpSessionStartHour) + "-" + IntegerToString(InpSessionEndHour)) : "");
    color nc = InpUseNewsFilter ? wt : ok;
    if(BlockedByRisk())
      {
@@ -822,8 +931,8 @@ void UpdateDashboard()
       nc = wt;
      }
 
-   DashLbl("t", x, y, dy + 2, "Trap Divergence Bot v1.0   " + g_sym_name + " / " + EnumToString(g_tf), wt2);
-   DashLbl("n", x, y, dy, nf, nc);
+   DashLbl("t", x, y, dy + 2, "Trap Divergence Bot v1.2_DEBUG   " + g_sym_name + " / " + EnumToString(g_tf), wt2);
+   DashLbl("n", x, y, dy, nf + sess, nc);
 
    string sqs = g_bear_sq ? "HIT" : "MISS";
    color sqc = g_bear_sq ? ok : wt;
